@@ -5,6 +5,7 @@ import { createPublicClient, http } from 'viem';
 import { WebSocket } from 'ws';
 import { mainnet } from 'viem/chains';
 import axios from 'axios';
+import fs from 'fs';
 import 'dotenv/config';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -22,6 +23,34 @@ const sdk = new OpenSeaSDK(
   { chain: Chain.Mainnet, apiKey: process.env.OPENSEA_API_KEY }
 );
 
+// --- Защита от дублей ---
+const DEDUP_FILE = './dedup.json';
+const DEDUP_WINDOW_MS = 30 * 60 * 1000; // 30 минут
+
+let processedListings = new Map();
+
+try {
+  const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
+  processedListings = new Map(Object.entries(data));
+} catch {}
+
+function isDuplicate(nftId) {
+  const now = Date.now();
+
+  for (const [id, ts] of processedListings.entries()) {
+    if (now - ts > DEDUP_WINDOW_MS) processedListings.delete(id);
+  }
+
+  if (processedListings.has(nftId)) return true;
+
+  processedListings.set(nftId, now);
+
+  try {
+    fs.writeFileSync(DEDUP_FILE, JSON.stringify(Object.fromEntries(processedListings)));
+  } catch {}
+  return false;
+}
+
 // --- Stream Client ---
 const stream = new OpenSeaStreamClient({
   apiKey: process.env.OPENSEA_API_KEY,
@@ -30,11 +59,12 @@ const stream = new OpenSeaStreamClient({
 
 stream.connect();
 
-// --- Слушаем новые листинги и шлём ТОЛЬКО в GROUP_CHAT_ID ---
+// --- Слушаем новые листинги ---
 stream.onItemListed(COLLECTION_SLUG, async (event) => {
   const nftId = event.payload.item?.nft_id;
 
   if (!nftId) return;
+  if (isDuplicate(nftId)) return;
 
   const nftName =
     event.payload.item?.metadata?.name ||
@@ -46,7 +76,6 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
 
   if (!priceEth) return;
 
-  // Курс ETH -> USD
   let priceUsd = null;
   try {
     const res = await axios.get(
@@ -54,9 +83,7 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
       { timeout: 5000 }
     );
     priceUsd = (priceEth * res.data.ethereum.usd).toFixed(2);
-  } catch (err) {
-    console.error('Не удалось получить курс USD:', err.message);
-  }
+  } catch {}
 
   const link = event.payload.item?.permalink ||
     `https://opensea.io/item/ethereum/${nftId}`;
@@ -68,45 +95,34 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
     `\n\n` +
     `🔗 [Open on OpenSea](${link})`;
 
-  if (!GROUP_CHAT_ID) {
-    console.error('GROUP_CHAT_ID не задан в .env');
-    return;
-  }
+  if (!GROUP_CHAT_ID) return;
 
   try {
     await bot.telegram.sendMessage(GROUP_CHAT_ID, caption, { parse_mode: 'Markdown' });
   } catch (err) {
-    console.error(`Не удалось отправить в группу ${GROUP_CHAT_ID}:`, err.message);
+    console.error(`Ошибка отправки в группу:`, err.message);
   }
 });
 
 // --- Команды (только для групп) ---
 
-// /start — приветствие
 bot.start((ctx) => {
   if (ctx.chat.type === 'private') return;
-  ctx.reply('👋 Бот активен. Уведомления о новых листингах приходят в эту группу.');
+  ctx.reply('👋 Бот активен.');
 });
 
-// /stop — заглушка
 bot.command('stop', (ctx) => {
   if (ctx.chat.type === 'private') return;
-  ctx.reply('ℹ️ Уведомления управляются администратором бота.');
+  ctx.reply('ℹ️ Уведомления управляются администратором.');
 });
 
-// /id — показать chat_id группы
 bot.command('id', (ctx) => {
   if (ctx.chat.type === 'private') return;
-
-  const chatId = ctx.chat.id;
-  const chatType = ctx.chat.type;
-  const chatTitle = ctx.chat.title || 'без названия';
-
   ctx.reply(
     `📋 *Информация о чате*\n\n` +
-    `🆔 ID: \`${chatId}\`\n` +
-    `📁 Тип: \`${chatType}\`\n` +
-    `📝 Название: ${chatTitle}`,
+    `🆔 ID: \`${ctx.chat.id}\`\n` +
+    `📁 Тип: \`${ctx.chat.type}\`\n` +
+    `📝 Название: ${ctx.chat.title || 'без названия'}`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -122,7 +138,7 @@ async function launchWithRetry(botInstance, options = {}, maxAttempts = 10) {
     try {
       await botInstance.telegram.deleteWebhook({ drop_pending_updates: true });
       await botInstance.launch(options);
-      console.log('🤖 Бот запущен и подключён к Telegram.');
+      console.log('🤖 Бот запущен.');
       return;
     } catch (err) {
       const isConflict =
@@ -132,24 +148,20 @@ async function launchWithRetry(botInstance, options = {}, maxAttempts = 10) {
 
       if (isConflict) {
         const delay = Math.min(1000 * 2 ** (attempt - 1), 30000);
-        console.warn(
-          `⚠️ Конфликт сессий Telegram (409), попытка ${attempt}/${maxAttempts} через ${delay}мс...`
-        );
         await new Promise((r) => setTimeout(r, delay));
       } else {
         throw err;
       }
     }
   }
-  throw new Error('Не удалось запустить бота после всех попыток');
+  throw new Error('Не удалось запустить бота');
 }
 
 launchWithRetry(bot).catch((err) => {
-  console.error('Фатальная ошибка запуска:', err);
+  console.error('Фатальная ошибка:', err);
   process.exit(1);
 });
 
-// --- Graceful shutdown ---
 process.once('SIGINT', () => {
   stream.disconnect();
   bot.stop('SIGINT');
