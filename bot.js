@@ -21,7 +21,7 @@ const sdk = new OpenSeaSDK(
   { chain: Chain.Mainnet, apiKey: process.env.OPENSEA_API_KEY }
 );
 
-// --- Хранилище подписчиков (чаты, где нажали /start) ---
+// --- Хранилище подписчиков (только группы) ---
 const subscribers = new Set();
 
 // --- Защита от дублей ---
@@ -98,39 +98,42 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
   }
 });
 
-// --- Команды ---
+// --- Команды (только для групп) ---
 
-// /start — включить уведомления для этого чата
+// /start — включить уведомления для этой группы
 bot.start((ctx) => {
+  // Игнорируем личку
+  if (ctx.chat.type === 'private') return;
+
   const chatId = String(ctx.chat.id);
-  const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-  const label = isGroup ? 'группы' : 'лички';
 
   if (subscribers.has(chatId)) {
-    return ctx.reply(`Уведомления для этой ${label} уже включены.`);
+    return ctx.reply('Уведомления для этой группы уже включены.');
   }
   subscribers.add(chatId);
-  ctx.reply(`✅ Уведомления для этой ${label} включены. Буду присылать новые листинги.`);
+  ctx.reply('✅ Уведомления включены. Буду присылать новые листинги.');
 });
 
 // /stop — выключить уведомления
 bot.command('stop', (ctx) => {
+  if (ctx.chat.type === 'private') return;
+
   const chatId = String(ctx.chat.id);
-  const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-  const label = isGroup ? 'группы' : 'лички';
 
   if (!subscribers.has(chatId)) {
-    return ctx.reply(`Уведомления для этой ${label} уже выключены.`);
+    return ctx.reply('Уведомления для этой группы уже выключены.');
   }
   subscribers.delete(chatId);
-  ctx.reply(`🔕 Уведомления для этой ${label} выключены.`);
+  ctx.reply('🔕 Уведомления выключены.');
 });
 
-// /id — показать chat_id
+// /id — показать chat_id группы
 bot.command('id', (ctx) => {
+  if (ctx.chat.type === 'private') return;
+
   const chatId = ctx.chat.id;
   const chatType = ctx.chat.type;
-  const chatTitle = ctx.chat.title || ctx.chat.username || 'личка';
+  const chatTitle = ctx.chat.title || 'без названия';
 
   ctx.reply(
     `📋 *Информация о чате*\n\n` +
