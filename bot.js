@@ -9,6 +9,7 @@ import 'dotenv/config';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const COLLECTION_SLUG = 'heroesofvaldir';
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
 
 // --- OpenSea SDK ---
 const publicClient = createPublicClient({
@@ -21,23 +22,6 @@ const sdk = new OpenSeaSDK(
   { chain: Chain.Mainnet, apiKey: process.env.OPENSEA_API_KEY }
 );
 
-// --- Хранилище подписчиков (только группы) ---
-const subscribers = new Set();
-
-// --- Защита от дублей ---
-const processedListings = new Map();
-const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 минут
-
-function isDuplicate(nftId) {
-  const now = Date.now();
-  for (const [id, ts] of processedListings.entries()) {
-    if (now - ts > DEDUP_WINDOW_MS) processedListings.delete(id);
-  }
-  if (processedListings.has(nftId)) return true;
-  processedListings.set(nftId, now);
-  return false;
-}
-
 // --- Stream Client ---
 const stream = new OpenSeaStreamClient({
   apiKey: process.env.OPENSEA_API_KEY,
@@ -46,14 +30,11 @@ const stream = new OpenSeaStreamClient({
 
 stream.connect();
 
-// --- Слушаем новые листинги ---
+// --- Слушаем новые листинги и шлём ТОЛЬКО в GROUP_CHAT_ID ---
 stream.onItemListed(COLLECTION_SLUG, async (event) => {
   const nftId = event.payload.item?.nft_id;
 
-  if (!nftId || isDuplicate(nftId)) {
-    console.log(`⏭ Пропускаем дубль: ${nftId}`);
-    return;
-  }
+  if (!nftId) return;
 
   const nftName =
     event.payload.item?.metadata?.name ||
@@ -87,44 +68,30 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
     `\n\n` +
     `🔗 [Open on OpenSea](${link})`;
 
-  if (subscribers.size === 0) return;
+  if (!GROUP_CHAT_ID) {
+    console.error('GROUP_CHAT_ID не задан в .env');
+    return;
+  }
 
-  for (const chatId of subscribers) {
-    try {
-      await bot.telegram.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
-    } catch (err) {
-      console.error(`Не удалось отправить в ${chatId}:`, err.message);
-    }
+  try {
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, caption, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error(`Не удалось отправить в группу ${GROUP_CHAT_ID}:`, err.message);
   }
 });
 
 // --- Команды (только для групп) ---
 
-// /start — включить уведомления для этой группы
+// /start — приветствие
 bot.start((ctx) => {
-  // Игнорируем личку
   if (ctx.chat.type === 'private') return;
-
-  const chatId = String(ctx.chat.id);
-
-  if (subscribers.has(chatId)) {
-    return ctx.reply('Уведомления для этой группы уже включены.');
-  }
-  subscribers.add(chatId);
-  ctx.reply('✅ Уведомления включены. Буду присылать новые листинги.');
+  ctx.reply('👋 Бот активен. Уведомления о новых листингах приходят в эту группу.');
 });
 
-// /stop — выключить уведомления
+// /stop — заглушка
 bot.command('stop', (ctx) => {
   if (ctx.chat.type === 'private') return;
-
-  const chatId = String(ctx.chat.id);
-
-  if (!subscribers.has(chatId)) {
-    return ctx.reply('Уведомления для этой группы уже выключены.');
-  }
-  subscribers.delete(chatId);
-  ctx.reply('🔕 Уведомления выключены.');
+  ctx.reply('ℹ️ Уведомления управляются администратором бота.');
 });
 
 // /id — показать chat_id группы
