@@ -21,8 +21,22 @@ const sdk = new OpenSeaSDK(
   { chain: Chain.Mainnet, apiKey: process.env.OPENSEA_API_KEY }
 );
 
-// --- Хранилище подписчиков ---
+// --- Хранилище подписчиков (чаты, где нажали /start) ---
 const subscribers = new Set();
+
+// --- Защита от дублей ---
+const processedListings = new Map();
+const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 минут
+
+function isDuplicate(nftId) {
+  const now = Date.now();
+  for (const [id, ts] of processedListings.entries()) {
+    if (now - ts > DEDUP_WINDOW_MS) processedListings.delete(id);
+  }
+  if (processedListings.has(nftId)) return true;
+  processedListings.set(nftId, now);
+  return false;
+}
 
 // --- Stream Client ---
 const stream = new OpenSeaStreamClient({
@@ -34,14 +48,16 @@ stream.connect();
 
 // --- Слушаем новые листинги ---
 stream.onItemListed(COLLECTION_SLUG, async (event) => {
-  if (subscribers.size === 0) return;
+  const nftId = event.payload.item?.nft_id;
+
+  if (!nftId || isDuplicate(nftId)) {
+    console.log(`⏭ Пропускаем дубль: ${nftId}`);
+    return;
+  }
 
   const nftName =
     event.payload.item?.metadata?.name ||
-    `#${event.payload.item?.nft_id?.split('/').pop()}`;
-
-  const rawImageUrl = event.payload.item?.metadata?.image_url;
-  const nftId = event.payload.item?.nft_id;
+    `#${nftId?.split('/').pop()}`;
 
   const priceEth = event.payload.base_price
     ? Number(BigInt(event.payload.base_price)) / 1e18
@@ -61,92 +77,68 @@ stream.onItemListed(COLLECTION_SLUG, async (event) => {
     console.error('Не удалось получить курс USD:', err.message);
   }
 
+  const link = event.payload.item?.permalink ||
+    `https://opensea.io/item/ethereum/${nftId}`;
+
   const caption =
     `🖼 *${nftName}*\n\n` +
     `💰 *${priceEth.toFixed(4)} ETH*` +
     (priceUsd ? ` (~$${priceUsd})` : '') +
     `\n\n` +
-    `🔗 [Open on OpenSea](${event.payload.item?.permalink || `https://opensea.io/item/ethereum/${nftId}`})`;
+    `🔗 [Open on OpenSea](${link})`;
 
-  // Собираем список URL для попытки скачать картинку
-  const imageUrls = [];
-  if (rawImageUrl) {
-    if (rawImageUrl.startsWith('ipfs://')) {
-      const hash = rawImageUrl.replace('ipfs://', '');
-      imageUrls.push(
-        `https://ipfs.io/ipfs/${hash}`,
-        `https://gateway.pinata.cloud/ipfs/${hash}`,
-        `https://dweb.link/ipfs/${hash}`,
-        `https://ipfs.filebase.io/ipfs/${hash}`
-      );
-    } else {
-      imageUrls.push(rawImageUrl);
-    }
-  }
+  if (subscribers.size === 0) return;
 
   for (const chatId of subscribers) {
     try {
-      let imageBuffer = null;
-
-      for (const url of imageUrls) {
-        try {
-          const resp = await axios.get(url, {
-            responseType: 'arraybuffer',
-            timeout: 15000,
-            headers: { 'User-Agent': 'Mozilla/5.0' },
-            maxContentLength: 10 * 1024 * 1024
-          });
-
-          const contentType = resp.headers['content-type'] || '';
-          if (contentType.startsWith('image/')) {
-            imageBuffer = Buffer.from(resp.data);
-            break;
-          } else {
-            console.log(`Шлюз ${url} вернул ${contentType}, пропускаем`);
-          }
-        } catch (err) {
-          console.log(`Шлюз ${url} не сработал: ${err.message}`);
-        }
-      }
-
-      if (imageBuffer) {
-        await bot.telegram.sendPhoto(
-          chatId,
-          { source: imageBuffer },
-          { caption, parse_mode: 'Markdown' }
-        );
-      } else {
-        await bot.telegram.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
-      }
+      await bot.telegram.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
     } catch (err) {
       console.error(`Не удалось отправить в ${chatId}:`, err.message);
-      try {
-        await bot.telegram.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
-      } catch (e) {
-        console.error('Фоллбек тоже не сработал:', e.message);
-      }
     }
   }
 });
 
 // --- Команды ---
 
+// /start — включить уведомления для этого чата
 bot.start((ctx) => {
-  const chatId = ctx.chat.id;
+  const chatId = String(ctx.chat.id);
+  const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+  const label = isGroup ? 'группы' : 'лички';
+
   if (subscribers.has(chatId)) {
-    return ctx.reply('Уведомления уже включены.');
+    return ctx.reply(`Уведомления для этой ${label} уже включены.`);
   }
   subscribers.add(chatId);
-  ctx.reply('✅ Уведомления включены. Буду присылать новые листинги.');
+  ctx.reply(`✅ Уведомления для этой ${label} включены. Буду присылать новые листинги.`);
 });
 
+// /stop — выключить уведомления
 bot.command('stop', (ctx) => {
-  const chatId = ctx.chat.id;
+  const chatId = String(ctx.chat.id);
+  const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+  const label = isGroup ? 'группы' : 'лички';
+
   if (!subscribers.has(chatId)) {
-    return ctx.reply('Уведомления уже выключены.');
+    return ctx.reply(`Уведомления для этой ${label} уже выключены.`);
   }
   subscribers.delete(chatId);
-  ctx.reply('🔕 Уведомления выключены.');
+  ctx.reply(`🔕 Уведомления для этой ${label} выключены.`);
+});
+
+// /id — показать chat_id
+bot.command('id', (ctx) => {
+  const chatId = ctx.chat.id;
+  const chatType = ctx.chat.type;
+  const chatTitle = ctx.chat.title || ctx.chat.username || 'личка';
+
+  ctx.reply(
+    `📋 *Информация о чате*\n\n` +
+    `🆔 ID: \`${chatId}\`\n` +
+    `📁 Тип: \`${chatType}\`\n` +
+    `📝 Название: ${chatTitle}`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // --- Обработка ошибок ---
